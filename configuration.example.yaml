@@ -1,0 +1,57 @@
+# Add to configuration.yaml, then restart Home Assistant (or reload pyscript).
+# Copy pyscript/apps/solis_power_down.py to <config>/pyscript/apps/solis_power_down.py
+#
+# Can share the pyscript: block with solis_ev_follow. This app only touches
+# one Solis *discharge* slot, so the two don't overwrite each other.
+
+pyscript:
+  hass_is_global: true
+  allow_all_imports: true
+  apps:
+    solis_power_down:
+      # --- SolisCloud credentials (same secrets as solis_ev_follow) ---
+      key_id: !secret solis_key_id
+      secret: !secret solis_secret
+      username: !secret solis_username
+      password: !secret solis_password
+      plantId: !secret solis_plant_id
+      # inverter_sn: !secret solis_inverter_sn   # only needed with multiple inverters
+
+      # --- Octopus ---
+      power_down_events_entity: event.octopus_energy_a_XXXXXXXX_octoplus_power_down_events
+      auto_join: true            # join every available Power Down session automatically
+      # notify_service: notify.mobile_app_your_phone
+
+      # --- Battery / entities ---
+      soc_sensor: sensor.solis_remaining_battery_capacity
+      battery_capacity_kwh: 10.0
+      floor_soc: 15              # never discharge below this (keep above the inverter's own reserve)
+      core_charge_soc: 100       # SOC the battery reaches by the end of the cheap window
+      # battery_voltage_sensor: sensor.solis_battery_voltage
+      battery_voltage: 51.2      # used when there's no voltage sensor
+
+      # --- Prediction ---
+      load_power_sensor: sensor.solis_house_load   # house consumption (W or kW), needs long-term statistics
+      history_days: 14
+      default_load_kw: 0.5       # used for hours with no history
+      reserve_margin: 1.2        # keep 20% extra for the evening
+      # solar_forecast_sensors:  # Solcast detailedForecast sensors (optional)
+      #   - sensor.solcast_pv_forecast_forecast_today
+      #   - sensor.solcast_pv_forecast_forecast_tomorrow
+
+      # --- Inverter limits ---
+      max_discharge_kw: 5.0
+      max_discharge_amps: 100
+      export_limit_kw: 3.68      # your DNO export limit (G98 = 3.68 kW)
+      discharge_efficiency: 0.95
+
+      # --- Behaviour (defaults shown) ---
+      discharge_slot: 1          # Solis discharge slot driven by this app
+      core_window: "23:30-05:30" # cheap window the evening reserve has to last until
+      prepare_minutes: 15        # write the slot this long before the session
+      current_step_amps: 5       # only rewrite the current mid-session if it moves this much
+      inverter_timezone: Europe/London
+      sync_inverter_time: true
+
+      # Start with this on: logs what it *would* write without touching the inverter.
+      diagnostics_only: true

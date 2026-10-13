@@ -1,0 +1,17 @@
+# Home Assistant secrets and local config — never commit these
+secrets.yaml
+configuration.yaml
+.storage/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
