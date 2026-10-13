@@ -51,7 +51,8 @@ class TriggerTests(unittest.TestCase):
     def test_unconfigured_events_entity(self):
         app = App({"power_down_events_entity": None})
         kinds = [t[1] for t in app.triggers if t[0] == "state_trigger"]
-        self.assertEqual(kinds, [("event.solis_power_down_unconfigured.*",)])
+        self.assertIn(("event.solis_power_down_unconfigured.*",), kinds)
+        self.assertIn(("input_boolean.solis_peak_export_unconfigured",), kinds)
 
 
 async def _noop():

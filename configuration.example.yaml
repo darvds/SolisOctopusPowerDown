@@ -22,6 +22,13 @@ pyscript:
       auto_join: true            # join every available Power Down session automatically
       # notify_service: notify.mobile_app_your_phone
 
+      # --- Daily peak export ---
+      peak_export: true
+      peak_window: "16:00-19:00"
+      peak_export_rate: 16       # p/kWh, only used for the value estimate
+      # peak_export_switch: input_boolean.solis_peak_export   # turn off to skip a day
+      notify_peak: false
+
       # --- Battery / entities ---
       soc_sensor: sensor.solis_remaining_battery_capacity
       battery_capacity_kwh: 10.0

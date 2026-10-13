@@ -1,15 +1,20 @@
 """
 Solis Power Down Export (pyscript app)
 
-Exports from the Solis battery during Octopus Octoplus "Power Down" sessions,
-sized so the battery still covers the house until the cheap overnight window.
+Exports from the Solis battery during Octopus Octoplus "Power Down" sessions
+and, optionally, every day in a peak export window (e.g. 16:00-19:00), sized
+so the battery still covers the house until the cheap overnight window.
 
 How it works
 ------------
 - Watches the Octopus Energy integration's power down events entity. Any
   available session is joined automatically (optional), and joined sessions
   are planned and exported.
-- For the next session it predicts:
+- Optionally adds a daily peak export window. Where a Power Down session
+  overlaps it, the peak window is split around the session, and battery is
+  held back during earlier peak time so the Power Down can export at full
+  power (Power Down first).
+- For the next window it predicts:
     * house load per half-hour, from the recorder's hourly statistics for the
       load sensor over the last N days (same time of day),
     * solar, from an optional Solcast forecast,
@@ -49,7 +54,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 log = logging.getLogger("pyscript.solis_power_down")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # -----------------------------
 # SolisCloud endpoints / constants
@@ -131,6 +136,12 @@ PREPARE_MINUTES = int(CFG.get("prepare_minutes", 15))
 CURRENT_STEP_AMPS = int(CFG.get("current_step_amps", 5))
 STARTUP_DELAY_SECONDS = int(CFG.get("startup_delay_seconds", 60))
 NOTIFY_SERVICE = str(CFG.get("notify_service", ""))
+
+PEAK_EXPORT = _cfg_bool("peak_export", False)
+PEAK_WINDOW = str(CFG.get("peak_window", "16:00-19:00"))
+PEAK_EXPORT_RATE = float(CFG.get("peak_export_rate", 16))
+PEAK_SWITCH = str(CFG.get("peak_export_switch", ""))
+NOTIFY_PEAK = _cfg_bool("notify_peak", False)
 
 INVERTER_TIMEZONE = str(CFG.get("inverter_timezone", hass.config.time_zone or "UTC"))
 SYNC_INVERTER_TIME = _cfg_bool("sync_inverter_time", True)
@@ -495,6 +506,7 @@ def _parse_window(text):
 
 
 CORE_START, CORE_END = _parse_window(CORE_WINDOW)
+PEAK_START, PEAK_END = _parse_window(PEAK_WINDOW)
 
 
 def now_local():
@@ -647,16 +659,90 @@ def sessions():
     return joined, available
 
 
-def target_session(now):
-    """The joined session that is running now, or else the next one."""
+def peak_switch_on():
+    if not PEAK_SWITCH:
+        return True
+    s = hass.states.get(PEAK_SWITCH)
+    return s is None or s.state != "off"
+
+
+def peak_windows(now, honour_switch=True):
+    """Daily peak export windows (yesterday to tomorrow) that haven't ended."""
+    if not PEAK_EXPORT or (honour_switch and not peak_switch_on()):
+        return []
+    out = []
+    for days in (-1, 0, 1):
+        day = now + timedelta(days=days)
+        start = _at_local_time(day, PEAK_START)
+        end = _at_local_time(day, PEAK_END)
+        if end <= start:
+            end = _at_local_time(day + timedelta(days=1), PEAK_END)
+        if end > now:
+            out.append({"id": f"peak-{to_local(start).strftime('%Y-%m-%d')}", "kind": "peak",
+                        "start": start, "end": end})
+    return out
+
+
+def export_rate_at(t):
+    """The peak export rate (p/kWh) if `t` is in a peak window, else None."""
+    for w in peak_windows(t, honour_switch=False):
+        if w["start"] <= t < w["end"]:
+            return PEAK_EXPORT_RATE
+    return None
+
+
+def export_windows(now):
+    """
+    Joined Power Down sessions and daily peak windows that haven't ended, as
+    non-overlapping segments sorted by start. Peak windows are cut around
+    Power Down sessions.
+    """
     joined, _ = sessions()
-    best = None
+    # Every joined session cuts the peak window, even one that has just ended,
+    # so the rest of the peak window keeps its own start time.
+    power_downs = []
+    segments = []
     for s in joined:
-        if s["end"] <= now:
-            continue
-        if best is None or s["start"] < best["start"]:
-            best = s
-    return best
+        w = dict(s)
+        w["kind"] = "power_down"
+        power_downs.append(w)
+        if w["end"] > now:
+            segments.append(w)
+
+    for p in peak_windows(now):
+        pieces = [(p["start"], p["end"])]
+        for d in power_downs:
+            cut = []
+            for a, b in pieces:
+                if d["end"] <= a or d["start"] >= b:
+                    cut.append((a, b))
+                    continue
+                if a < d["start"]:
+                    cut.append((a, d["start"]))
+                if d["end"] < b:
+                    cut.append((d["end"], b))
+            pieces = cut
+        for a, b in pieces:
+            if b > now:
+                segments.append({"id": f"{p['id']}-{to_local(a).strftime('%H%M')}", "kind": "peak",
+                                 "start": a, "end": b, "octopoints_per_kwh": 0.0})
+
+    ordered = sorted([(w["start"].timestamp(), i) for i, w in enumerate(segments)])
+    return [segments[i] for _, i in ordered]
+
+
+def target_window(now):
+    """
+    (window, later): the export window running now or else the next one, and
+    the windows after it that come before the next cheap window.
+    """
+    windows = export_windows(now)
+    for i, w in enumerate(windows):
+        if w["end"] > now:
+            cutoff = next_core_start(w["end"])
+            later = [x for x in windows[i + 1:] if x["start"] < cutoff]
+            return w, later
+    return None, []
 
 
 async def auto_join():
@@ -778,11 +864,12 @@ def solar_forecast():
 # -----------------------------
 # Prediction
 # -----------------------------
-def predict(session, now, soc, voltage, load_profile, solar):
+def predict(session, now, soc, voltage, load_profile, solar, later=None):
     """
-    Plan the export for `session`. All energies in kWh, powers in kW.
+    Plan the export for the window `session`. All energies in kWh, powers in kW.
     `soc` is the battery SOC now (%), `load_profile` {local hour: kW},
-    `solar` {UTC half-hour: kW}.
+    `solar` {UTC half-hour: kW}, `later` the windows after it and before the
+    cheap window (battery is held back for Power Down ones).
     """
     cap = BATTERY_CAPACITY_KWH
 
@@ -797,6 +884,20 @@ def predict(session, now, soc, voltage, load_profile, solar):
         for t, h in periods(a, b):
             total += max(0.0, load_kw(t) - solar_kw(t)) * h
         return total
+
+    volts = voltage if voltage and voltage > 0 else BATTERY_VOLTAGE
+
+    def max_battery_kw(a, b):
+        """The most the battery can usefully give in [a, b): inverter, current and export caps."""
+        hrs = 0.0
+        house = 0.0
+        for t, h in periods(a, b):
+            hrs += h
+            house += (load_kw(t) - solar_kw(t)) * h
+        if hrs <= 0:
+            return 0.0, 0.0
+        export_cap = max(0.0, (EXPORT_LIMIT_KW + house / hrs) / DISCHARGE_EFFICIENCY)
+        return min(MAX_DISCHARGE_KW, MAX_DISCHARGE_AMPS * volts / 1000.0, export_cap), hrs
 
     start = max(session["start"], now)
     end = session["end"]
@@ -815,7 +916,14 @@ def predict(session, now, soc, voltage, load_profile, solar):
         evening_kwh = 0.0
     else:
         evening_kwh = net_drain(end, next_core_start(end))
-    reserve_kwh = min(cap, floor_kwh + RESERVE_MARGIN * evening_kwh)
+    # Power Down first: keep what later Power Down sessions can export. Their
+    # house load is already in the evening reserve.
+    held_kwh = 0.0
+    for w in later or []:
+        if w.get("kind") == "power_down":
+            kw, hrs = max_battery_kw(max(w["start"], end), w["end"])
+            held_kwh += max(0.0, kw * hrs - net_drain(max(w["start"], end), w["end"]))
+    reserve_kwh = min(cap, floor_kwh + RESERVE_MARGIN * evening_kwh + held_kwh)
 
     session_periods = periods(start, end)
     hours = 0.0
@@ -834,7 +942,6 @@ def predict(session, now, soc, voltage, load_profile, solar):
     else:
         power_kw = 0.0
 
-    volts = voltage if voltage and voltage > 0 else BATTERY_VOLTAGE
     current = 0
     if power_kw > 0:
         current = min(MAX_DISCHARGE_AMPS, int(math.ceil(power_kw * 1000.0 / volts - 1e-6)))
@@ -842,10 +949,15 @@ def predict(session, now, soc, voltage, load_profile, solar):
 
     export_kwh = 0.0
     import_kwh = 0.0
+    value_pence = 0.0
     for t, h in session_periods:
         net = power_kw * DISCHARGE_EFFICIENCY + solar_kw(t) - load_kw(t)
-        export_kwh += min(EXPORT_LIMIT_KW, max(0.0, net)) * h
+        exported = min(EXPORT_LIMIT_KW, max(0.0, net)) * h
+        export_kwh += exported
         import_kwh += max(0.0, -net) * h
+        rate = export_rate_at(t)
+        if rate is not None:
+            value_pence += exported * rate
 
     stop_soc = int(math.ceil(reserve_kwh / cap * 100.0 - 1e-6)) if cap > 0 else 100
     stop_soc = max(FLOOR_SOC, min(100, stop_soc))
@@ -855,9 +967,12 @@ def predict(session, now, soc, voltage, load_profile, solar):
         "session_start": session["start"].isoformat(),
         "session_end": session["end"].isoformat(),
         "window": fmt_window(session["start"], session["end"]),
+        "window_kind": session.get("kind", "power_down"),
+        "window_id": session.get("id"),
         "hours": round(hours, 3),
         "battery_at_start_kwh": round(battery_at_start, 2),
         "reserve_kwh": round(reserve_kwh, 2),
+        "held_for_power_down_kwh": round(held_kwh, 2),
         "evening_load_kwh": round(evening_kwh, 2),
         "spare_kwh": round(spare_kwh, 2),
         "battery_used_kwh": round(power_kw * hours, 2),
@@ -868,18 +983,19 @@ def predict(session, now, soc, voltage, load_profile, solar):
         "predicted_solar_kwh": round(solar_kwh, 2),
         "predicted_export_kwh": round(export_kwh, 2),
         "predicted_import_kwh": round(import_kwh, 2),
-        "estimated_octopoints": int(round(avoided_kwh * session["octopoints_per_kwh"])),
+        "estimated_octopoints": int(round(avoided_kwh * session.get("octopoints_per_kwh", 0))),
+        "estimated_export_value_pence": round(value_pence, 1),
     }
 
 
-async def plan_for(session, now):
+async def plan_for(session, now, later=None):
     soc = _float_state(SOC_SENSOR)
     if soc is None:
         log.warning("SOC sensor '%s' unavailable; can't plan", SOC_SENSOR)
         return None
     voltage = _float_state(BATTERY_VOLTAGE_SENSOR)
     profile = await ensure_load_profile()
-    return predict(session, now, soc, voltage, profile, solar_forecast())
+    return predict(session, now, soc, voltage, profile, solar_forecast(), later)
 
 
 # -----------------------------
@@ -951,10 +1067,10 @@ async def reconcile(reason):
     _flags["busy"] = True
     try:
         now = now_local()
-        session = target_session(now)
+        session, later = target_window(now)
         plan = None
         if session is not None:
-            plan = await plan_for(session, now)
+            plan = await plan_for(session, now, later)
         want = desired_program(session, plan, now)
         ops = ops_for(want)
 
@@ -965,10 +1081,12 @@ async def reconcile(reason):
             _flags["last_write_ok"] = ok
             if ok:
                 _apply_ops_to_program(ops)
-                if want["enabled"] and session["id"] not in _joined["notified"]:
+                is_power_down = session is not None and session["kind"] == "power_down"
+                if want["enabled"] and session["id"] not in _joined["notified"] \
+                        and (is_power_down or NOTIFY_PEAK):
                     _joined["notified"].add(session["id"])
                     await notify(
-                        "Power Down export planned",
+                        "Power Down export planned" if is_power_down else "Peak export planned",
                         f"{plan['window']}: exporting ~{plan['predicted_export_kwh']} kWh at "
                         f"{plan['discharge_current']} A, stopping at {plan['stop_soc']}% "
                         f"({plan['reserve_kwh']} kWh kept for the evening).",
@@ -989,12 +1107,13 @@ async def reconcile(reason):
 
 
 def publish_status(session, plan, now):
-    active = session is not None and session["start"] <= now < session["end"]
+    running = session is not None and session["start"] <= now < session["end"]
+    active = running and session["kind"] == "power_down"
     if session is None:
         status = "idle"
     elif plan is not None and plan["discharge_current"] <= 0:
         status = "no_spare_energy"
-    elif active and _program["enabled"]:
+    elif running and _program["enabled"]:
         status = "exporting"
     elif _program["enabled"]:
         status = "armed"
@@ -1036,8 +1155,9 @@ def publish_status(session, plan, now):
 # -----------------------------
 @time_trigger("startup")
 async def solis_power_down_startup():
-    log.info("=== Solis Power Down v%s starting (discharge slot %s, tz %s, diagnostics_only=%s) ===",
-             VERSION, DISCHARGE_SLOT, INVERTER_TIMEZONE, DIAGNOSTICS_ONLY)
+    log.info("=== Solis Power Down v%s starting (discharge slot %s, tz %s, diagnostics_only=%s, "
+             "peak_export=%s %s) ===", VERSION, DISCHARGE_SLOT, INVERTER_TIMEZONE, DIAGNOSTICS_ONLY,
+             PEAK_EXPORT, PEAK_WINDOW if PEAK_EXPORT else "")
     if not 1 <= DISCHARGE_SLOT <= 6:
         log.error("discharge_slot must be 1-6, not %s", DISCHARGE_SLOT)
         return
@@ -1061,6 +1181,12 @@ async def solis_power_down_events_changed(var_name=None, value=None):
     await reconcile("events changed")
 
 
+@state_trigger(f"{PEAK_SWITCH or 'input_boolean.solis_peak_export_unconfigured'}")
+async def solis_power_down_peak_switch_changed(var_name=None, value=None):
+    log.info("Peak export switch %s is now %s", var_name, value)
+    await reconcile("peak switch")
+
+
 @time_trigger("cron(*/5 * * * *)")
 async def solis_power_down_periodic():
     await reconcile("periodic")
@@ -1076,7 +1202,7 @@ async def solis_power_down_join_sweep():
 # -----------------------------
 @service
 async def solis_power_down_reconcile():
-    """Re-plan the next Power Down session and update the Solis discharge slot now."""
+    """Re-plan the next export window and update the Solis discharge slot now."""
     await auto_join()
     await reconcile("manual")
 
@@ -1093,16 +1219,16 @@ async def solis_power_down_clear():
 
 @service
 async def solis_power_down_preview():
-    """Log the export prediction for the next joined (or available) session without writing."""
+    """Log the export prediction for the next window (or available session) without writing."""
     now = now_local()
-    session = target_session(now)
+    session, later = target_window(now)
     if session is None:
         _, available = sessions()
         for s in available:
             if s["end"] > now and (session is None or s["start"] < session["start"]):
                 session = s
     if session is None:
-        log.info("Preview: no upcoming Power Down session")
+        log.info("Preview: no upcoming export window")
         return
-    plan = await plan_for(session, now)
+    plan = await plan_for(session, now, later)
     log.info("Preview for %s: %s", fmt_window(session["start"], session["end"]), plan)

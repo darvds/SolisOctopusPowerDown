@@ -1,6 +1,6 @@
 # Solis Power Down Export
 
-A [pyscript](https://github.com/custom-components/pyscript) app for Home Assistant that exports from a **Solis** home battery during **Octopus Octoplus Power Down** sessions. It predicts how much the battery can export while still covering the house until the cheap overnight window.
+A [pyscript](https://github.com/custom-components/pyscript) app for Home Assistant that exports from a **Solis** home battery during **Octopus Octoplus Power Down** sessions and, optionally, **every day in your peak export window** (e.g. 16:00–19:00 at 16p). It predicts how much the battery can export while still covering the house until the cheap overnight window.
 
 It's a companion to [Solis EV-Follow](https://github.com/darvds/SolisOctopusEVFollow) and shares its SolisCloud code.
 
@@ -30,6 +30,21 @@ The example uses a 10 kWh battery, a 15% floor, `reserve_margin: 1.0`, a 0.5 kW 
 | Evening reserve (1.5 + 18:00–23:30 × 0.5 kW) | 4.25 kWh |
 | Discharge | 1.25 kW ≈ 25 A, stop at 43% |
 | Predicted export | 0.69 kWh (the house uses 0.5 kWh; 5% is conversion loss) |
+
+## Daily peak export
+
+Set `peak_export: true` and the app also exports every day in `peak_window` (default `16:00-19:00`). It uses the same prediction: everything above the evening reserve goes out, spread over the window.
+
+**Power Down comes first.** On Power Down days:
+- **Peak window split:** the peak window is cut around the session. A 17:00–18:00 Power Down gives three windows: 16:00–17:00 peak, 17:00–18:00 Power Down, 18:00–19:00 peak. The discharge slot is rewritten at each boundary (within a few seconds, by the 5-minute check at :00).
+- **Battery held back:** before a Power Down (in the peak window, or any time before the cheap window), the app keeps back what the Power Down session can export at full power. This shows as `held_for_power_down_kwh` and is included in the stop SOC.
+- **Power Down session:** it exports as hard as the limits allow, and the remaining peak time gets whatever is left.
+
+For example, with a 10 kWh battery, a 10% floor, a 0.5 kW house, 50 V, a 5 kW export limit and no conversion losses, a full battery at 15:45 and no Power Down gives: 45 A from 16:00–19:00, stopping at 33%, ≈5.1 kWh exported ≈ 82p. With a 17:00–18:00 Power Down: 23 A for 16:00–17:00 (stop at 88%), then 100 A for the Power Down, then the rest for 18:00–19:00.
+
+**Skip a day:** set `peak_export_switch` to an `input_boolean` (create it under Settings → Devices & services → Helpers). When it's off, peak exports stop, including one that's running, while Power Down sessions carry on.
+
+`estimated_export_value_pence` on the status sensor is the predicted export inside peak hours × `peak_export_rate`.
 
 ## Requirements
 
@@ -79,6 +94,11 @@ Start with `diagnostics_only: true`. Run **`pyscript.solis_power_down_preview`**
 | `export_limit_kw` | `3.68` | Your export limit |
 | `discharge_efficiency` | `0.95` | Battery-to-AC efficiency |
 | `discharge_slot` | `1` | Solis discharge slot driven by this app (1–6) |
+| `peak_export` | `false` | Also export every day in `peak_window` |
+| `peak_window` | `16:00-19:00` | Daily peak export window |
+| `peak_export_rate` | `16` | Peak export rate in p/kWh, used for the value estimate |
+| `peak_export_switch` | none | `input_boolean` that turns peak exports off when it's off |
+| `notify_peak` | `false` | Also notify when a daily peak export is armed |
 | `core_window` | `23:30-05:30` | Cheap window the reserve has to last until |
 | `prepare_minutes` | `15` | How long before the session the slot is written |
 | `current_step_amps` | `5` | Minimum change before the current is rewritten mid-session |
@@ -93,16 +113,16 @@ Start with `diagnostics_only: true`. Run **`pyscript.solis_power_down_preview`**
 
 - **`sensor.solis_power_down`**
   - **State:** one of the following.
-    - `idle`: no session coming up.
-    - `planned`: a session is coming but the slot isn't written yet.
+    - `idle`: no Power Down session or peak window coming up.
+    - `planned`: a window is coming but the slot isn't written yet.
     - `armed`: the slot is written.
-    - `exporting`: the session is running.
+    - `exporting`: the window is running.
     - `no_spare_energy`: nothing above the reserve to export.
-  - **Attributes:** the full prediction (`predicted_export_kwh`, `predicted_house_load_kwh`, `reserve_kwh`, `battery_at_start_kwh`, `discharge_current`, `stop_soc`, `estimated_octopoints`, …), plus what's programmed on the inverter.
-- **`binary_sensor.solis_power_down_active`**: `on` during a session.
+  - **Attributes:** `window_kind` (`peak` / `power_down`), `window_id`, the full prediction (`predicted_export_kwh`, `held_for_power_down_kwh`, `estimated_export_value_pence`, `predicted_house_load_kwh`, `reserve_kwh`, `battery_at_start_kwh`, `discharge_current`, `stop_soc`, `estimated_octopoints`, …), plus what's programmed on the inverter.
+- **`binary_sensor.solis_power_down_active`**: `on` during a Power Down session (not during peak exports).
 - **Actions** (Developer Tools → Actions):
   - `pyscript.solis_power_down_reconcile`: join, re-plan and update the slot now.
-  - `pyscript.solis_power_down_preview`: log the prediction for the next session without writing.
+  - `pyscript.solis_power_down_preview`: log the prediction for the next window without writing.
   - `pyscript.solis_power_down_clear`: switch off and clear the discharge slot.
 - **Debug logging:**
   ```yaml

@@ -17,10 +17,10 @@ class SessionTests(unittest.TestCase):
         app = App()
         app.set_events(joined=[event("19:00", "20:00", eid="2"), event("17:00", "18:00", eid="1")])
         app.at("12:00")
-        self.assertEqual(app.target_session(local("12:00"))["id"], "1")
-        self.assertEqual(app.target_session(local("17:30"))["id"], "1")
-        self.assertEqual(app.target_session(local("18:00"))["id"], "2")
-        self.assertIsNone(app.target_session(local("20:00")))
+        self.assertEqual(app.target_window(local("12:00"))[0]["id"], "1")
+        self.assertEqual(app.target_window(local("17:30"))[0]["id"], "1")
+        self.assertEqual(app.target_window(local("18:00"))[0]["id"], "2")
+        self.assertIsNone(app.target_window(local("20:00"))[0])
 
     def test_ignores_bad_events(self):
         app = App()
@@ -29,7 +29,7 @@ class SessionTests(unittest.TestCase):
 
     def test_missing_entity(self):
         app = App()
-        self.assertIsNone(app.target_session(local("12:00")))
+        self.assertIsNone(app.target_window(local("12:00"))[0])
 
 
 class AutoJoinTests(unittest.TestCase):
@@ -42,7 +42,7 @@ class AutoJoinTests(unittest.TestCase):
         call = app.services.calls[0]
         self.assertEqual(call["target"], {"entity_id": EVENTS})
         # Treated as joined before the integration refreshes.
-        self.assertEqual(app.target_session(local("12:00"))["id"], "5")
+        self.assertEqual(app.target_window(local("12:00"))[0]["id"], "5")
         self.assertEqual(len(app.services.notifications()), 1)
         self.assertEqual(app.services.notifications()[0]["service"], "mobile_app_phone")
 
@@ -58,11 +58,11 @@ class AutoJoinTests(unittest.TestCase):
         app.set_events(available=[event("17:00", "18:00", eid="5", code="PD5")])
         app.services.fail.add(("octopus_energy", "join_octoplus_power_down_session_event"))
         app.run(app.auto_join())
-        self.assertIsNone(app.target_session(local("12:00")))
+        self.assertIsNone(app.target_window(local("12:00"))[0])
         app.services.fail.clear()
         app.run(app.auto_join())
         self.assertEqual(app.services.joins(), ["PD5", "PD5"])
-        self.assertIsNotNone(app.target_session(local("12:00")))
+        self.assertIsNotNone(app.target_window(local("12:00"))[0])
 
     def test_disabled(self):
         app = App({"auto_join": False})
