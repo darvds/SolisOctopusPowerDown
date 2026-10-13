@@ -114,6 +114,46 @@ class PeakPredictionTests(unittest.TestCase):
         self.assertEqual(p["estimated_octopoints"], 400)
 
 
+class MinExportTests(unittest.TestCase):
+    """Little spare energy: forcing a slot below the house load would import at peak."""
+
+    def setUp(self):
+        # Your 13 Oct case: ~0.9 kW house, 1.2 kWh spare for the rest of the peak.
+        self.app = peak_app({"default_load_kw": 0.9})
+        self.app.at("16:25")
+
+    def test_low_export_rate_is_not_armed(self):
+        self.app.set_soc(63)
+        self.app.reconcile()
+        p = self.app.status()[2]
+        self.assertGreater(p["discharge_current"], 0)
+        self.assertLess(p["predicted_export_kw"], 0.2)
+        self.assertEqual(self.app.ops, [])
+        self.assertEqual(self.app.status()[1], "no_spare_energy")
+
+    def test_useful_export_rate_is_armed(self):
+        self.app.set_soc(100)
+        self.app.reconcile()
+        self.assertGreaterEqual(self.app.status()[2]["predicted_export_kw"], 0.2)
+        self.assertEqual(self.app.status()[1], "exporting")
+
+    def test_armed_slot_cleared_when_rate_drops(self):
+        self.app.set_soc(100)
+        self.app.reconcile()
+        self.app.ops.clear()
+        self.app.at("17:30")
+        self.app.set_soc(64)  # house used more than predicted
+        self.app.reconcile()
+        self.assertEqual(self.app.ops, [CLEAR])
+
+    def test_threshold_configurable(self):
+        app = peak_app({"default_load_kw": 0.9, "min_export_kw": 0})
+        app.at("16:25")
+        app.set_soc(63)
+        app.reconcile()
+        self.assertEqual(app.status()[1], "exporting")
+
+
 class PeakScenarioTests(unittest.TestCase):
     def run_steps(self, app, steps):
         for hhmm, soc, expected, status in steps:
@@ -131,7 +171,7 @@ class PeakScenarioTests(unittest.TestCase):
             ("15:30", 100, [], "planned"),
             ("15:45", 100, [arm("16:00-19:00", 45, 33)], "armed"),
             ("16:30", 87, [], "exporting"),
-            ("19:00", 33, [CLEAR], "planned"),  # tomorrow's window is next
+            ("19:00", 33, [CLEAR], "no_spare_energy"),  # tomorrow: daytime use leaves too little
         ])
         self.assertEqual(app.active(), "off")
         self.assertEqual(app.status()[2]["window_kind"], "peak")
@@ -143,7 +183,7 @@ class PeakScenarioTests(unittest.TestCase):
             ("16:30", 94, [], "exporting"),
             ("17:00", 88, [arm("17:00-18:00", 100, 38)], "exporting"),
             ("18:00", 43, [arm("18:00-19:00", 21, 33)], "exporting"),
-            ("19:00", 33, [CLEAR], "planned"),
+            ("19:00", 33, [CLEAR], "no_spare_energy"),
         ])
 
     def test_active_sensor_only_for_power_down(self):

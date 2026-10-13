@@ -101,6 +101,7 @@ Start with `diagnostics_only: true`. Run **`pyscript.solis_power_down_preview`**
 | `notify_peak` | `false` | Also notify when a daily peak export is armed |
 | `core_window` | `23:30-05:30` | Cheap window the reserve has to last until |
 | `prepare_minutes` | `15` | How long before the session the slot is written |
+| `min_export_kw` | `0.2` | Only arm the slot if the plan exports at least this rate. Below it, a forced discharge would leave the house partly on the grid, so self-use is better. |
 | `current_step_amps` | `5` | Minimum change before the current is rewritten mid-session |
 | `inverter_timezone` | HA time zone | Time zone the inverter clock and slots use |
 | `sync_inverter_time` | `true` | Sync the inverter clock (at most once per 24h) |
@@ -117,7 +118,7 @@ Start with `diagnostics_only: true`. Run **`pyscript.solis_power_down_preview`**
     - `planned`: a window is coming but the slot isn't written yet.
     - `armed`: the slot is written.
     - `exporting`: the window is running.
-    - `no_spare_energy`: nothing above the reserve to export.
+    - `no_spare_energy`: too little above the reserve to export at `min_export_kw` or more, so the slot stays off and self-use covers the house.
   - **Attributes:** `window_kind` (`peak` / `power_down`), `window_id`, the full prediction (`predicted_export_kwh`, `held_for_power_down_kwh`, `estimated_export_value_pence`, `predicted_house_load_kwh`, `reserve_kwh`, `battery_at_start_kwh`, `discharge_current`, `stop_soc`, `estimated_octopoints`, …), plus what's programmed on the inverter.
 - **`binary_sensor.solis_power_down_active`**: `on` during a Power Down session (not during peak exports).
 - **Actions** (Developer Tools → Actions):

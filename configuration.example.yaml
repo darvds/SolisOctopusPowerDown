@@ -56,6 +56,7 @@ pyscript:
       discharge_slot: 1          # Solis discharge slot driven by this app
       core_window: "23:30-05:30" # cheap window the evening reserve has to last until
       prepare_minutes: 15        # write the slot this long before the session
+      min_export_kw: 0.2         # don't force a discharge that would barely export
       current_step_amps: 5       # only rewrite the current mid-session if it moves this much
       inverter_timezone: Europe/London
       sync_inverter_time: true

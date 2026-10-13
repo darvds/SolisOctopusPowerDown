@@ -54,7 +54,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 log = logging.getLogger("pyscript.solis_power_down")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # -----------------------------
 # SolisCloud endpoints / constants
@@ -134,6 +134,7 @@ DISCHARGE_SLOT = int(CFG.get("discharge_slot", 1))
 CORE_WINDOW = str(CFG.get("core_window", "23:30-05:30"))
 PREPARE_MINUTES = int(CFG.get("prepare_minutes", 15))
 CURRENT_STEP_AMPS = int(CFG.get("current_step_amps", 5))
+MIN_EXPORT_KW = float(CFG.get("min_export_kw", 0.2))
 STARTUP_DELAY_SECONDS = int(CFG.get("startup_delay_seconds", 60))
 NOTIFY_SERVICE = str(CFG.get("notify_service", ""))
 
@@ -982,6 +983,7 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None):
         "predicted_house_load_kwh": round(load_kwh, 2),
         "predicted_solar_kwh": round(solar_kwh, 2),
         "predicted_export_kwh": round(export_kwh, 2),
+        "predicted_export_kw": round(export_kwh / hours, 2) if hours > 0 else 0.0,
         "predicted_import_kwh": round(import_kwh, 2),
         "estimated_octopoints": int(round(avoided_kwh * session.get("octopoints_per_kwh", 0))),
         "estimated_export_value_pence": round(value_pence, 1),
@@ -1001,13 +1003,22 @@ async def plan_for(session, now, later=None):
 # -----------------------------
 # Reconcile: make the discharge slot match the plan
 # -----------------------------
+def worth_exporting(plan):
+    """
+    Only force a discharge when it actually exports at a useful rate. A slot
+    whose current is below the house load makes the grid cover the gap, which
+    is worse than leaving the inverter in self-use.
+    """
+    return plan["discharge_current"] > 0 and plan["predicted_export_kw"] >= MIN_EXPORT_KW
+
+
 def desired_program(session, plan, now):
     """What the discharge slot should hold right now."""
     if session is None or plan is None:
         return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}
     if now < session["start"] - timedelta(minutes=PREPARE_MINUTES) or now >= session["end"]:
         return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}
-    if plan["discharge_current"] <= 0:
+    if not worth_exporting(plan):
         return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}
     return {
         "window": fmt_window(session["start"], session["end"]),
@@ -1111,7 +1122,7 @@ def publish_status(session, plan, now):
     active = running and session["kind"] == "power_down"
     if session is None:
         status = "idle"
-    elif plan is not None and plan["discharge_current"] <= 0:
+    elif plan is not None and not worth_exporting(plan):
         status = "no_spare_energy"
     elif running and _program["enabled"]:
         status = "exporting"
