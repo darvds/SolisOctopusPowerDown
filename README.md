@@ -120,6 +120,7 @@ Start with `diagnostics_only: true`. Run **`pyscript.solis_power_down_preview`**
     - `exporting`: the window is running.
     - `no_spare_energy`: too little above the reserve to export at `min_export_kw` or more, so the slot stays off and self-use covers the house.
   - **Attributes:** `window_kind` (`peak` / `power_down`), `window_id`, the full prediction (`predicted_export_kwh`, `held_for_power_down_kwh`, `estimated_export_value_pence`, `predicted_house_load_kwh`, `reserve_kwh`, `battery_at_start_kwh`, `discharge_current`, `stop_soc`, `estimated_octopoints`, …), plus what's programmed on the inverter.
+  - **`power_down_events`:** `ok`, `missing` or `not_configured`. When it isn't `ok`, a `warning` attribute explains why. The same message is logged as an error once an hour.
 - **`binary_sensor.solis_power_down_active`**: `on` during a Power Down session (not during peak exports).
 - **Actions** (Developer Tools → Actions):
   - `pyscript.solis_power_down_reconcile`: join, re-plan and update the slot now.
@@ -131,6 +132,11 @@ Start with `diagnostics_only: true`. Run **`pyscript.solis_power_down_preview`**
     logs:
       pyscript.solis_power_down: debug
   ```
+
+## Troubleshooting
+
+- **Power Down sessions are ignored and only the peak export runs.** Check `power_down_events` on `sensor.solis_power_down`. If it says `missing`, the `power_down_events_entity` in `configuration.yaml` doesn't match a real entity. Copy the exact ID from Developer Tools → States. It should look like `event.octopus_energy_a_xxxxxxxx_octoplus_power_down_events`.
+- **Changes to `configuration.yaml` aren't picked up.** Restart Home Assistant, then check `version` and `last_updated` on the status sensor.
 
 ## Notes
 

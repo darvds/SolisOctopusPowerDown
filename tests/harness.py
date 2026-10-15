@@ -195,6 +195,7 @@ class App:
             "service": self._service,
             "time_trigger": self._trigger("time_trigger"),
             "state_trigger": self._trigger("state_trigger"),
+            "event_trigger": self._trigger("event_trigger"),
         }
         source = APP_PATH.read_text()
         exec(compile(source, str(APP_PATH), "exec"), g)

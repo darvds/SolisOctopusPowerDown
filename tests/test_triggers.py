@@ -9,7 +9,7 @@ class TriggerTests(unittest.TestCase):
         kinds = {(t[0], t[1]) for t in app.triggers}
         self.assertIn(("time_trigger", ("startup",)), kinds)
         self.assertIn(("time_trigger", ("cron(*/5 * * * *)",)), kinds)
-        self.assertIn(("state_trigger", (f"{EVENTS}.*",)), kinds)
+        self.assertIn(("event_trigger", ("state_changed", f"entity_id == '{EVENTS}'")), kinds)
         self.assertEqual(set(app.service_funcs), {
             "solis_power_down_reconcile", "solis_power_down_clear", "solis_power_down_preview"})
 
@@ -31,7 +31,7 @@ class TriggerTests(unittest.TestCase):
         app.set_events(joined=[event("17:00", "18:00")])
         app.at("16:50")
         app.set_soc(56.25)
-        app.run(app.solis_power_down_events_changed())
+        app.run(app.solis_power_down_events_changed(entity_id=EVENTS, old_state=None, new_state=None))
         self.assertEqual(len(app.ops), 1)
 
     def test_clear_service(self):
@@ -50,9 +50,19 @@ class TriggerTests(unittest.TestCase):
 
     def test_unconfigured_events_entity(self):
         app = App({"power_down_events_entity": None})
+        self.assertIn(("event_trigger", ("state_changed", "entity_id == ''")),
+                      [(t[0], t[1]) for t in app.triggers])
         kinds = [t[1] for t in app.triggers if t[0] == "state_trigger"]
-        self.assertIn(("event.solis_power_down_unconfigured.*",), kinds)
         self.assertIn(("input_boolean.solis_peak_export_unconfigured",), kinds)
+
+    def test_no_state_trigger_on_event_domain(self):
+        # pyscript reads `event` in a state_trigger expression as its own built-in.
+        for config in ({}, {"power_down_events_entity": None}):
+            app = App(config)
+            for kind, args, _ in app.triggers:
+                if kind == "state_trigger":
+                    for arg in args:
+                        self.assertFalse(str(arg).startswith("event."), arg)
 
 
 async def _noop():

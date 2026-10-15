@@ -54,7 +54,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 log = logging.getLogger("pyscript.solis_power_down")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # -----------------------------
 # SolisCloud endpoints / constants
@@ -167,7 +167,7 @@ except Exception as e:
 _program = {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False, "unknown": True}
 _cache = {"inverter_id": None, "inverter_sn": None, "last_time_sync": None,
           "load_profile": None, "load_profile_at": None}
-_flags = {"busy": False, "last_reason": None, "last_write_ok": None}
+_flags = {"busy": False, "last_reason": None, "last_write_ok": None, "events_warned_at": None}
 # Sessions we joined ourselves (id -> session), so we act on them even before
 # the integration refreshes joined_events, and which sessions we've announced.
 _joined = {"by_us": {}, "notified": set()}
@@ -746,8 +746,42 @@ def target_window(now):
     return None, []
 
 
+def events_entity_status():
+    """"ok", "not_configured" or "missing" for the power down events entity."""
+    if not EVENTS_ENTITY:
+        return "not_configured"
+    if hass.states.get(EVENTS_ENTITY) is None:
+        return "missing"
+    return "ok"
+
+
+def events_entity_warning(status):
+    if status == "missing":
+        return (f"Power down events entity '{EVENTS_ENTITY}' doesn't exist, so Power Down sessions "
+                f"are ignored. Check power_down_events_entity against Developer Tools -> States.")
+    if status == "not_configured":
+        return "power_down_events_entity isn't set, so Power Down sessions are ignored."
+    return None
+
+
+def warn_events_entity(status):
+    """Log a missing/unset events entity at most once an hour."""
+    if status == "ok":
+        _flags["events_warned_at"] = None
+        return
+    now = datetime.now(timezone.utc)
+    last = _flags["events_warned_at"]
+    if last is not None and now - last < timedelta(hours=1):
+        return
+    _flags["events_warned_at"] = now
+    if status == "missing":
+        log.error(events_entity_warning(status))
+    else:
+        log.warning(events_entity_warning(status))
+
+
 async def auto_join():
-    if not AUTO_JOIN or not EVENTS_ENTITY:
+    if not AUTO_JOIN or events_entity_status() != "ok":
         return
     now = now_local()
     _, available = sessions()
@@ -1078,6 +1112,8 @@ async def reconcile(reason):
     _flags["busy"] = True
     try:
         now = now_local()
+        events_status = events_entity_status()
+        warn_events_entity(events_status)
         session, later = target_window(now)
         plan = None
         if session is not None:
@@ -1112,12 +1148,12 @@ async def reconcile(reason):
         _last["plan"] = plan
         _last["session"] = session
         _flags["last_reason"] = reason
-        publish_status(session, plan, now)
+        publish_status(session, plan, now, events_status)
     finally:
         _flags["busy"] = False
 
 
-def publish_status(session, plan, now):
+def publish_status(session, plan, now, events_status="ok"):
     running = session is not None and session["start"] <= now < session["end"]
     active = running and session["kind"] == "power_down"
     if session is None:
@@ -1144,12 +1180,16 @@ def publish_status(session, plan, now):
         "slot_state_unknown": _program["unknown"],
         "last_reason": _flags["last_reason"],
         "last_write_ok": _flags["last_write_ok"],
+        "power_down_events": events_status,
         "diagnostics_only": DIAGNOSTICS_ONLY,
         "version": VERSION,
         "last_updated": datetime.now(timezone.utc).isoformat(),
         "friendly_name": "Solis Power Down",
         "icon": "mdi:transmission-tower-export",
     }
+    warning = events_entity_warning(events_status)
+    if warning:
+        attrs["warning"] = warning
     if plan:
         for key, value in plan.items():
             if key not in ("session_start", "session_end"):
@@ -1185,8 +1225,11 @@ async def solis_power_down_startup():
     await reconcile("startup")
 
 
-@state_trigger(f"{EVENTS_ENTITY or 'event.solis_power_down_unconfigured'}.*")
-async def solis_power_down_events_changed(var_name=None, value=None):
+# Not a state_trigger: in pyscript expressions `event` is its own built-in,
+# so `event.<entity>` can't be used there. state_changed covers state and
+# attribute changes for any domain.
+@event_trigger("state_changed", f"entity_id == '{EVENTS_ENTITY}'")
+async def solis_power_down_events_changed(entity_id=None, **kwargs):
     task.unique("solis_power_down_events", kill_me=True)
     await auto_join()
     await reconcile("events changed")
