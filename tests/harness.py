@@ -21,6 +21,8 @@ TZ = ZoneInfo("Europe/London")
 
 EVENTS = "event.octopus_energy_a_test_octoplus_power_down_events"
 SOC = "sensor.solis_battery_soc"
+AXLE_SENSORS = ["sensor.axle_energy_event_type", "sensor.axle_energy_event_start",
+                "sensor.axle_energy_event_end"]
 LOAD = "sensor.solis_house_load"
 
 BASE_CONFIG = {
@@ -247,6 +249,16 @@ class App:
     def set_events(self, joined=(), available=()):
         self.states[EVENTS] = ("2026-10-06T10:00:00+00:00",
                                {"joined_events": list(joined), "available_events": list(available)})
+
+    def set_axle(self, kind=None, start=None, end=None, day=6):
+        """Axle Energy sensors; kind None means no event (all 'unknown')."""
+        if kind is None:
+            values = ("unknown", "unknown", "unknown")
+        else:
+            values = (kind, local(start, day).astimezone(timezone.utc).isoformat(),
+                      local(end, day).astimezone(timezone.utc).isoformat())
+        for entity, value in zip(AXLE_SENSORS, values):
+            self.states[entity] = (value, {})
 
     def at(self, hhmm, day=6):
         """Freeze the app's clock at 2026-10-<day> HH:MM (Europe/London)."""

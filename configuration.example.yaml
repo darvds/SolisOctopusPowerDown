@@ -29,6 +29,13 @@ pyscript:
       # peak_export_switch: input_boolean.solis_peak_export   # turn off to skip a day
       notify_peak: false
 
+      # --- Axle Energy (top priority; the app stays off the inverter during events) ---
+      axle_events: true
+      # axle_event_type_sensor: sensor.axle_energy_event_type
+      # axle_event_start_sensor: sensor.axle_energy_event_start
+      # axle_event_end_sensor: sensor.axle_energy_event_end
+      axle_grace_minutes: 10
+
       # --- Battery / entities ---
       soc_sensor: sensor.solis_remaining_battery_capacity
       battery_capacity_kwh: 10.0

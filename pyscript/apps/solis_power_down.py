@@ -54,7 +54,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 log = logging.getLogger("pyscript.solis_power_down")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # -----------------------------
 # SolisCloud endpoints / constants
@@ -144,6 +144,13 @@ PEAK_EXPORT_RATE = float(CFG.get("peak_export_rate", 16))
 PEAK_SWITCH = str(CFG.get("peak_export_switch", ""))
 NOTIFY_PEAK = _cfg_bool("notify_peak", False)
 
+AXLE_EVENTS = _cfg_bool("axle_events", False)
+AXLE_TYPE_SENSOR = str(CFG.get("axle_event_type_sensor", "sensor.axle_energy_event_type"))
+AXLE_START_SENSOR = str(CFG.get("axle_event_start_sensor", "sensor.axle_energy_event_start"))
+AXLE_END_SENSOR = str(CFG.get("axle_event_end_sensor", "sensor.axle_energy_event_end"))
+AXLE_SENSORS = [AXLE_TYPE_SENSOR, AXLE_START_SENSOR, AXLE_END_SENSOR] if AXLE_EVENTS else []
+AXLE_GRACE_MINUTES = int(CFG.get("axle_grace_minutes", 10))
+
 INVERTER_TIMEZONE = str(CFG.get("inverter_timezone", hass.config.time_zone or "UTC"))
 SYNC_INVERTER_TIME = _cfg_bool("sync_inverter_time", True)
 
@@ -164,10 +171,12 @@ except Exception as e:
 # -----------------------------
 # What we last wrote to the discharge slot. "unknown" means we don't know
 # what's on the inverter (e.g. after a restart) and must write it.
-_program = {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False, "unknown": True}
+_program = {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False, "unknown": True,
+            "ends": None}
 _cache = {"inverter_id": None, "inverter_sn": None, "last_time_sync": None,
           "load_profile": None, "load_profile_at": None}
-_flags = {"busy": False, "last_reason": None, "last_write_ok": None, "events_warned_at": None}
+_flags = {"busy": False, "last_reason": None, "last_write_ok": None, "events_warned_at": None,
+          "axle_warned_at": None}
 # Sessions we joined ourselves (id -> session), so we act on them even before
 # the integration refreshes joined_events, and which sessions we've announced.
 _joined = {"by_us": {}, "notified": set()}
@@ -692,37 +701,99 @@ def export_rate_at(t):
     return None
 
 
+def axle_entities_status():
+    """"disabled", "ok" or "missing" for the Axle Energy sensors."""
+    if not AXLE_EVENTS:
+        return "disabled"
+    for entity in AXLE_SENSORS:
+        if hass.states.get(entity) is None:
+            return "missing"
+    return "ok"
+
+
+def axle_warning(status):
+    if status == "missing":
+        missing = [e for e in AXLE_SENSORS if hass.states.get(e) is None]
+        return (f"Axle Energy sensor(s) {', '.join(missing)} don't exist, so Axle events are "
+                f"ignored. Check the axle_event_*_sensor settings against Developer Tools -> States.")
+    return None
+
+
+def axle_event(now):
+    """
+    The current or next Axle event as a window, or None. Axle drives the
+    battery itself during it; `end` includes a grace period after the event.
+    """
+    if axle_entities_status() != "ok":
+        return None
+    kind = str(hass.states.get(AXLE_TYPE_SENSOR).state).lower()
+    if kind not in ("export", "import"):
+        return None
+    start = parse_dt(hass.states.get(AXLE_START_SENSOR).state)
+    event_end = parse_dt(hass.states.get(AXLE_END_SENSOR).state)
+    if start is None or event_end is None or event_end <= start:
+        return None
+    end = event_end + timedelta(minutes=AXLE_GRACE_MINUTES)
+    if end <= now:
+        return None
+    return {"id": f"axle-{start.astimezone(timezone.utc).strftime('%Y%m%dT%H%M')}",
+            "kind": "axle_" + kind, "start": start, "end": end, "event_end": event_end,
+            "octopoints_per_kwh": 0.0}
+
+
+def is_axle(window):
+    return window is not None and str(window.get("kind", "")).startswith("axle")
+
+
+def _cut(pieces, start, end):
+    """Remove [start, end) from a list of (a, b) pieces."""
+    cut = []
+    for a, b in pieces:
+        if end <= a or start >= b:
+            cut.append((a, b))
+            continue
+        if a < start:
+            cut.append((a, start))
+        if end < b:
+            cut.append((end, b))
+    return cut
+
+
 def export_windows(now):
     """
-    Joined Power Down sessions and daily peak windows that haven't ended, as
-    non-overlapping segments sorted by start. Peak windows are cut around
-    Power Down sessions.
+    The Axle event, joined Power Down sessions and daily peak windows that
+    haven't ended, as non-overlapping segments sorted by start. Priority is
+    Axle, then Power Down, then peak: each is cut around the ones above it.
     """
+    segments = []
+    axle = axle_event(now)
+    if axle is not None:
+        segments.append(axle)
+
     joined, _ = sessions()
     # Every joined session cuts the peak window, even one that has just ended,
     # so the rest of the peak window keeps its own start time.
     power_downs = []
-    segments = []
     for s in joined:
-        w = dict(s)
-        w["kind"] = "power_down"
-        power_downs.append(w)
-        if w["end"] > now:
-            segments.append(w)
+        power_downs.append(s)
+        pieces = [(s["start"], s["end"])]
+        if axle is not None:
+            pieces = _cut(pieces, axle["start"], axle["end"])
+        for a, b in pieces:
+            if b > now:
+                w = dict(s)
+                w["kind"] = "power_down"
+                w["start"], w["end"] = a, b
+                if (a, b) != (s["start"], s["end"]):
+                    w["id"] = f"{s['id']}-{to_local(a).strftime('%H%M')}"
+                segments.append(w)
 
     for p in peak_windows(now):
         pieces = [(p["start"], p["end"])]
+        if axle is not None:
+            pieces = _cut(pieces, axle["start"], axle["end"])
         for d in power_downs:
-            cut = []
-            for a, b in pieces:
-                if d["end"] <= a or d["start"] >= b:
-                    cut.append((a, b))
-                    continue
-                if a < d["start"]:
-                    cut.append((a, d["start"]))
-                if d["end"] < b:
-                    cut.append((d["end"], b))
-            pieces = cut
+            pieces = _cut(pieces, d["start"], d["end"])
         for a, b in pieces:
             if b > now:
                 segments.append({"id": f"{p['id']}-{to_local(a).strftime('%H%M')}", "kind": "peak",
@@ -778,6 +849,19 @@ def warn_events_entity(status):
         log.error(events_entity_warning(status))
     else:
         log.warning(events_entity_warning(status))
+
+
+def warn_axle(status):
+    """Log missing Axle sensors at most once an hour."""
+    if status != "missing":
+        _flags["axle_warned_at"] = None
+        return
+    now = datetime.now(timezone.utc)
+    last = _flags["axle_warned_at"]
+    if last is not None and now - last < timedelta(hours=1):
+        return
+    _flags["axle_warned_at"] = now
+    log.error(axle_warning(status))
 
 
 async def auto_join():
@@ -955,7 +1039,7 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None):
     # house load is already in the evening reserve.
     held_kwh = 0.0
     for w in later or []:
-        if w.get("kind") == "power_down":
+        if w.get("kind") in ("power_down", "axle_export"):
             kw, hrs = max_battery_kw(max(w["start"], end), w["end"])
             held_kwh += max(0.0, kw * hrs - net_drain(max(w["start"], end), w["end"]))
     reserve_kwh = min(cap, floor_kwh + RESERVE_MARGIN * evening_kwh + held_kwh)
@@ -1048,7 +1132,7 @@ def worth_exporting(plan):
 
 def desired_program(session, plan, now):
     """What the discharge slot should hold right now."""
-    if session is None or plan is None:
+    if session is None or plan is None or is_axle(session):
         return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}
     if now < session["start"] - timedelta(minutes=PREPARE_MINUTES) or now >= session["end"]:
         return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}
@@ -1114,12 +1198,23 @@ async def reconcile(reason):
         now = now_local()
         events_status = events_entity_status()
         warn_events_entity(events_status)
+        axle_status = axle_entities_status()
+        warn_axle(axle_status)
         session, later = target_window(now)
         plan = None
-        if session is not None:
+        if session is not None and not is_axle(session):
             plan = await plan_for(session, now, later)
         want = desired_program(session, plan, now)
-        ops = ops_for(want)
+        if is_axle(session) and session["start"] <= now:
+            # Axle is driving the battery: stay off the inverter. The only
+            # write allowed is switching off a slot we armed that would still
+            # be discharging now (an event announced after we armed).
+            ops = []
+            ends = _program["ends"]
+            if _program["enabled"] and not _program["unknown"] and (ends is None or ends > now):
+                ops = ops_for(want)
+        else:
+            ops = ops_for(want)
 
         if ops:
             log.info("[%s] discharge slot %s -> %s (current=%s soc=%s) via %s",
@@ -1128,6 +1223,7 @@ async def reconcile(reason):
             _flags["last_write_ok"] = ok
             if ok:
                 _apply_ops_to_program(ops)
+                _program["ends"] = session["end"] if want["enabled"] else None
                 is_power_down = session is not None and session["kind"] == "power_down"
                 if want["enabled"] and session["id"] not in _joined["notified"] \
                         and (is_power_down or NOTIFY_PEAK):
@@ -1148,16 +1244,18 @@ async def reconcile(reason):
         _last["plan"] = plan
         _last["session"] = session
         _flags["last_reason"] = reason
-        publish_status(session, plan, now, events_status)
+        publish_status(session, plan, now, events_status, axle_status)
     finally:
         _flags["busy"] = False
 
 
-def publish_status(session, plan, now, events_status="ok"):
+def publish_status(session, plan, now, events_status="ok", axle_status="disabled"):
     running = session is not None and session["start"] <= now < session["end"]
     active = running and session["kind"] == "power_down"
     if session is None:
         status = "idle"
+    elif is_axle(session):
+        status = "axle_event" if running else "axle_upcoming"
     elif plan is not None and not worth_exporting(plan):
         status = "no_spare_energy"
     elif running and _program["enabled"]:
@@ -1181,15 +1279,21 @@ def publish_status(session, plan, now, events_status="ok"):
         "last_reason": _flags["last_reason"],
         "last_write_ok": _flags["last_write_ok"],
         "power_down_events": events_status,
+        "axle_events": axle_status,
         "diagnostics_only": DIAGNOSTICS_ONLY,
         "version": VERSION,
         "last_updated": datetime.now(timezone.utc).isoformat(),
         "friendly_name": "Solis Power Down",
         "icon": "mdi:transmission-tower-export",
     }
-    warning = events_entity_warning(events_status)
-    if warning:
-        attrs["warning"] = warning
+    if is_axle(session):
+        attrs["window_kind"] = session["kind"]
+        attrs["axle_event_type"] = session["kind"][len("axle_"):]
+        attrs["axle_event_start"] = to_local(session["start"]).isoformat()
+        attrs["axle_event_end"] = to_local(session["event_end"]).isoformat()
+    warnings = [w for w in (events_entity_warning(events_status), axle_warning(axle_status)) if w]
+    if warnings:
+        attrs["warning"] = " ".join(warnings)
     if plan:
         for key, value in plan.items():
             if key not in ("session_start", "session_end"):
@@ -1207,8 +1311,8 @@ def publish_status(session, plan, now, events_status="ok"):
 @time_trigger("startup")
 async def solis_power_down_startup():
     log.info("=== Solis Power Down v%s starting (discharge slot %s, tz %s, diagnostics_only=%s, "
-             "peak_export=%s %s) ===", VERSION, DISCHARGE_SLOT, INVERTER_TIMEZONE, DIAGNOSTICS_ONLY,
-             PEAK_EXPORT, PEAK_WINDOW if PEAK_EXPORT else "")
+             "peak_export=%s %s, axle_events=%s) ===", VERSION, DISCHARGE_SLOT, INVERTER_TIMEZONE,
+             DIAGNOSTICS_ONLY, PEAK_EXPORT, PEAK_WINDOW if PEAK_EXPORT else "", AXLE_EVENTS)
     if not 1 <= DISCHARGE_SLOT <= 6:
         log.error("discharge_slot must be 1-6, not %s", DISCHARGE_SLOT)
         return
@@ -1233,6 +1337,12 @@ async def solis_power_down_events_changed(entity_id=None, **kwargs):
     task.unique("solis_power_down_events", kill_me=True)
     await auto_join()
     await reconcile("events changed")
+
+
+@event_trigger("state_changed", "entity_id in " + repr(AXLE_SENSORS))
+async def solis_power_down_axle_changed(entity_id=None, **kwargs):
+    task.unique("solis_power_down_axle", kill_me=True)
+    await reconcile("axle event changed")
 
 
 @state_trigger(f"{PEAK_SWITCH or 'input_boolean.solis_peak_export_unconfigured'}")
@@ -1268,7 +1378,7 @@ async def solis_power_down_clear():
     ok = await solis_apply(ops_for({"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}))
     if ok:
         _program.update({"window": EMPTY_SLOT, "current": None, "soc": None,
-                         "enabled": False, "unknown": False})
+                         "enabled": False, "unknown": False, "ends": None})
 
 
 @service

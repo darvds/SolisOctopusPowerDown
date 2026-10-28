@@ -46,6 +46,25 @@ For example, with a 10 kWh battery, a 10% floor, a 0.5 kW house, 50 V, a 5 kW ex
 
 `estimated_export_value_pence` on the status sensor is the predicted export inside peak hours × `peak_export_rate`.
 
+## Axle Energy events
+
+If Axle Energy also has access to your battery, set `axle_events: true`. The app then reads the [Axle Energy integration](https://www.home-assistant.io/integrations/axle_energy/)'s event sensors and puts Axle first.
+
+**Priority: Axle → Octopus Power Down → daily peak.** Each window is cut around the ones above it. For example, a 16:00–19:00 peak, an Axle export event at 17:30–18:30 and a Power Down at 18:00–19:00 give:
+
+| Window | What the app does |
+|---|---|
+| 16:00–17:30 peak | Exports what's spare, holding battery back for Axle |
+| 17:30–18:40 Axle | Stays off the inverter (event plus `axle_grace_minutes`) |
+| 18:40–19:00 Power Down | Exports what's left |
+
+- **Before an Axle export event:** earlier windows hold back as much as the battery could export in the event at full power, the same way they do for a Power Down. It shows in `held_for_power_down_kwh` and in the stop SOC.
+- **During any Axle event (export or import) and for the grace period after it:** the app makes no inverter writes. Axle drives the battery itself. The only exception is when Axle announces an event while the app's own slot is still discharging; then the app switches its slot off once.
+- **Import (turn-up) events:** no export runs during them, and nothing is held back for them.
+- **Restarts mid-event:** the app waits until the event and grace period are over before touching the inverter.
+
+**Make sure Axle doesn't use the same Solis discharge slot as this app.** If it does, set `discharge_slot` to a slot Axle leaves alone.
+
 ## Requirements
 
 - Home Assistant with [pyscript](https://github.com/custom-components/pyscript) (HACS).
@@ -99,6 +118,11 @@ Start with `diagnostics_only: true`. Run **`pyscript.solis_power_down_preview`**
 | `peak_export_rate` | `16` | Peak export rate in p/kWh, used for the value estimate |
 | `peak_export_switch` | none | `input_boolean` that turns peak exports off when it's off |
 | `notify_peak` | `false` | Also notify when a daily peak export is armed |
+| `axle_events` | `false` | Give Axle Energy events top priority and stay off the inverter during them |
+| `axle_event_type_sensor` | `sensor.axle_energy_event_type` | Axle event type (`export` / `import`) |
+| `axle_event_start_sensor` | `sensor.axle_energy_event_start` | Axle event start |
+| `axle_event_end_sensor` | `sensor.axle_energy_event_end` | Axle event end |
+| `axle_grace_minutes` | `10` | How long after an Axle event to keep off the inverter |
 | `core_window` | `23:30-05:30` | Cheap window the reserve has to last until |
 | `prepare_minutes` | `15` | How long before the session the slot is written |
 | `min_export_kw` | `0.2` | Only arm the slot if the plan exports at least this rate. Below it, a forced discharge would leave the house partly on the grid, so self-use is better. |
@@ -118,9 +142,11 @@ Start with `diagnostics_only: true`. Run **`pyscript.solis_power_down_preview`**
     - `planned`: a window is coming but the slot isn't written yet.
     - `armed`: the slot is written.
     - `exporting`: the window is running.
+    - `axle_upcoming` / `axle_event`: the next window is an Axle event, or one is running and the app is standing aside.
     - `no_spare_energy`: too little above the reserve to export at `min_export_kw` or more, so the slot stays off and self-use covers the house.
-  - **Attributes:** `window_kind` (`peak` / `power_down`), `window_id`, the full prediction (`predicted_export_kwh`, `held_for_power_down_kwh`, `estimated_export_value_pence`, `predicted_house_load_kwh`, `reserve_kwh`, `battery_at_start_kwh`, `discharge_current`, `stop_soc`, `estimated_octopoints`, …), plus what's programmed on the inverter.
+  - **Attributes:** `window_kind` (`peak` / `power_down` / `axle_export` / `axle_import`), `window_id`, the full prediction (`predicted_export_kwh`, `held_for_power_down_kwh`, `estimated_export_value_pence`, `predicted_house_load_kwh`, `reserve_kwh`, `battery_at_start_kwh`, `discharge_current`, `stop_soc`, `estimated_octopoints`, …), plus what's programmed on the inverter.
   - **`power_down_events`:** `ok`, `missing` or `not_configured`. When it isn't `ok`, a `warning` attribute explains why. The same message is logged as an error once an hour.
+  - **`axle_events`:** `disabled`, `ok` or `missing`, with the same `warning` and hourly log. During Axle windows, `axle_event_type`, `axle_event_start` and `axle_event_end` are shown too.
 - **`binary_sensor.solis_power_down_active`**: `on` during a Power Down session (not during peak exports).
 - **Actions** (Developer Tools → Actions):
   - `pyscript.solis_power_down_reconcile`: join, re-plan and update the slot now.
@@ -136,6 +162,7 @@ Start with `diagnostics_only: true`. Run **`pyscript.solis_power_down_preview`**
 ## Troubleshooting
 
 - **Power Down sessions are ignored and only the peak export runs.** Check `power_down_events` on `sensor.solis_power_down`. If it says `missing`, the `power_down_events_entity` in `configuration.yaml` doesn't match a real entity. Copy the exact ID from Developer Tools → States. It should look like `event.octopus_energy_a_xxxxxxxx_octoplus_power_down_events`.
+- **Axle events are ignored.** Check `axle_events` on `sensor.solis_power_down`. If it says `missing`, set the `axle_event_*_sensor` options to the IDs shown under the Axle Energy device.
 - **Changes to `configuration.yaml` aren't picked up.** Restart Home Assistant, then check `version` and `last_updated` on the status sensor.
 
 ## Notes
